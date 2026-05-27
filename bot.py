@@ -42,10 +42,14 @@ BUY_PREMIUM_MSG = (
     f"🚫 Aapke *{APPROVAL_DAYS} din* poore ho gaye hain.\n\n"
     "🔓 *Premium Access Kaise Lein?*\n"
     "👉 Admin se sampark karein aur apna subscription renew karein.\n\n"
-    f"📩 Admin: {ADMIN_USERNAME}\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "✨ _Premium members ko unlimited access milta hai!_"
 )
+
+def buy_premium_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🆘 Support", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"),
+    ]])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,7 +76,7 @@ pool: asyncpg.Pool = None
 # ─── DB Init ───────────────────────────────────────────────────────────────────
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, ssl="require")
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, ssl="require", statement_cache_size=0)
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS media (
@@ -195,7 +199,7 @@ async def expiry_checker(bot: Bot):
                 async with pool.acquire() as conn:
                     await conn.execute("UPDATE users SET is_approved = FALSE WHERE user_id = $1", uid)
                 try:
-                    await bot.send_message(chat_id=uid, text=BUY_PREMIUM_MSG, parse_mode="Markdown")
+                    await bot.send_message(chat_id=uid, text=BUY_PREMIUM_MSG, parse_mode="Markdown", reply_markup=buy_premium_keyboard())
                 except TelegramError:
                     pass
                 logger.info(f"⏰ Auto-banned expired user: {uid}")
@@ -219,13 +223,12 @@ async def expiry_checker(bot: Bot):
                     f"⚠️ *Premium Expire Hone Wala Hai!*\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"📅 Aapka premium *{exp_str}* ko expire ho jayega.\n\n"
-                    f"🔓 Ab hi renew karo — admin se sampark karo:\n"
-                    f"📩 {ADMIN_USERNAME}\n"
+                    f"🔓 Ab hi renew karo — admin se sampark karo!\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"✨ _Access khatam hone se pehle renew karo!_"
                 )
                 try:
-                    await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+                    await bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown", reply_markup=buy_premium_keyboard())
                     async with pool.acquire() as conn:
                         await conn.execute("""
                             INSERT INTO expiry_notified (user_id) VALUES ($1)
@@ -478,6 +481,20 @@ async def auto_delete(bot: Bot, chat_id: int, message_id: int, delay: int):
             chat_id, message_id, delete_at
         )
 
+async def send_welcome_video(bot: Bot, user_id: int):
+    """Send first video to newly approved user with 10-min auto-delete."""
+    try:
+        media = await get_next_media(user_id)
+        if not media:
+            return
+        await mark_seen(user_id, media["id"])
+        msg = await _copy_media(bot, user_id, media)
+        await auto_delete(bot, user_id, msg.message_id, 600)  # 10 min
+        await save_position(user_id, media["id"], msg.message_id)
+    except Exception as e:
+        logger.error(f"send_welcome_video error for {user_id}: {e}")
+
+
 async def deletion_loop(bot: Bot):
     """Runs every 30 seconds — deletes messages whose time has come."""
     while True:
@@ -504,7 +521,8 @@ async def check_ban(update: Update, ctx=None) -> bool:
         expired  = await is_expired(user_id)
         msg_text = BUY_PREMIUM_MSG if expired else "🚫 *Aap ban ho gaye hain.*\nAdmin se contact karein."
         if update.message:
-            await update.message.reply_text(msg_text, parse_mode="Markdown")
+            kb = buy_premium_keyboard() if expired else None
+            await update.message.reply_text(msg_text, parse_mode="Markdown", reply_markup=kb)
         elif update.callback_query:
             await update.callback_query.answer("💎 Premium expire! Admin se contact karein.", show_alert=True)
         # Notify admin — expired users get Approve/Reject, manually banned get Approve/Keep Banned
@@ -606,7 +624,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await is_banned(user_id):
-        r = await update.message.reply_text(BUY_PREMIUM_MSG, parse_mode="Markdown")
+        r = await update.message.reply_text(BUY_PREMIUM_MSG, parse_mode="Markdown", reply_markup=buy_premium_keyboard())
         await _schedule_cmd_delete(ctx.bot, update, r, DEL_QUICK)
         return
     async with pool.acquire() as conn:
@@ -668,6 +686,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"🎉 *Aapka access restore ho gaya!*\n\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀",
                     parse_mode="Markdown"
                 )
+                await send_welcome_video(ctx.bot, target_id)
             except TelegramError:
                 pass
         elif data.startswith("reject_"):
@@ -1018,6 +1037,7 @@ async def approve_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎉 *Aapka access restore ho gaya!*\n\n📅 Expiry: *{expires.strftime('%d %b %Y')}*\n\n/start dabao aur enjoy karo 🚀",
             parse_mode="Markdown"
         )
+        await send_welcome_video(ctx.bot, target_id)
     except TelegramError:
         pass
 
